@@ -3,19 +3,26 @@
 #include "engine.h"
 
 #include "mu2000.h"
+#include "bootcache.h"
 #include "nvram.h"
 #include "smartmedia.h"
+#include "ui/xg_state.h"
+#include "ui/xg_ui.h"
 
 #include "compat/paths.h"
 #include "compat/platform.h"
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <thread>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -221,6 +228,18 @@ void engine::start()
 		m_thread = std::thread([this] { boot(); });
 }
 
+bool engine::wait_ready(int ms)
+{
+	start();
+	const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+	while (state() == status::loading) {
+		if (std::chrono::steady_clock::now() >= limit)
+			return false;
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	return true;
+}
+
 void engine::boot()
 {
 	std::string tried;
@@ -287,23 +306,63 @@ void engine::boot()
 	// DAW の中では、DAW が管理しない糸が 1 本増える。嫌う DAW や、自分でコアを割り振りたい人のために、
 	// %LOCALAPPDATA%\S-MU2000\plugin.ini に threaded=0 と書けば 1 本で回す
 	bool threaded = true;
+	// MIDI IN の口 C・D（パート 33-64）は実機では USB だけの口で、firmware は
+	// HOST SELECT が USB のときしか通さない。**既定は USB**（実機を PC に繋ぐときと
+	// 同じ姿）。A・B も USB 側を通り、バイトの届き方が DIN の 31250bps から
+	// 実機の USB の速さになる。plugin.ini に usb=0 と書けば DIN に戻る
+	bool usb = true;
+	// エフェクトを C++ で鳴らす軽量モード（doc/native-dsp.md）。0 切 / 1 エフェクトだけ /
+	// 2 MEG を回さない。**実機と同じ音にはならない**ので既定は切
+	int native_fx = 0;
 	if (const std::string local = smu2000::config_dir(); !local.empty())
 		if (std::FILE *f = std::fopen(smu2000::join(local, "plugin.ini").c_str(), "rb")) {
 			char line[256];
-			while (std::fgets(line, sizeof(line), f))
+			while (std::fgets(line, sizeof(line), f)) {
 				if (!std::strncmp(line, "threaded=", 9))
 					threaded = line[9] != '0';
+				if (!std::strncmp(line, "usb=", 4))
+					usb = line[4] != '0';
+				if (!std::strncmp(line, "native_fx=", 10))
+					native_fx = std::atoi(line + 10);
+			}
 			std::fclose(f);
 		}
+	// 一覧やエディタで音色の名前と楽器の絵を利用者の ROM から読む（xg/voices.h）。
+	// gui.exe と同じ
+	ui::xgui::set_voice_rom(mu->program_rom());
+	mu->set_usb_host(usb);
+	logf(usb ? "MIDI は USB の口（A-D の 64 パート）" : "plugin.ini: usb=0（DIN の口 A・B だけ）");
 	mu->set_threaded(threaded);
 	if (!threaded)
 		logf("plugin.ini: threaded=0（スレーブを別スレッドにしない）");
+	if (native_fx) {
+		mu->set_native_fx(native_fx);
+		logf(native_fx >= 2 ? "plugin.ini: native_fx=2（MEG を回さず C++ のエフェクトで鳴らす）"
+		                    : "plugin.ini: native_fx=1（C++ のエフェクトを足す）");
+	}
 	// gui / live が残した設定で起動する。**読むだけで書かない。**VST3 の中で
 	// 変えたものは DAW のプロジェクトに残るし、何枚も挿されたときに
 	// 同じファイルを取り合わずに済む
 	if (nvram::load(*mu))
 		logf("設定: %s", nvram::path(*mu).c_str());
+
+	// 鍵は起動に使うワーク RAM も混ぜるので、reset() の前に作る
+	const u64 boot_key = bootcache::key(*mu);
 	mu->reset();
+
+	// 前に起動し切った姿を取ってあれば、そこから始める（bootcache.h）。
+	// 回した結果と 1 ビットも違わないので音は同じで、DAW に何枚挿しても
+	// そのたびに黙ることが無くなる。
+	// **reset() のあとで読むこと**（タイマが揃っていないと形が合わない）
+	if (bootcache::load(*mu, boot_key)) {
+		logf("起動: 前の写しから（%s）", bootcache::path(boot_key).c_str());
+		m_mu = mu;
+		m_message = warn.empty() ? std::string("ROM: ") + dir
+		                         : std::string("ROM: ") + dir + "\n警告: " + warn;
+		m_state.store(status::ready, std::memory_order_release);
+		ui::driver::publish_now(*m_mu, m_bridge, true, nullptr);
+		return;
+	}
 
 	ui::driver::publish_message(m_bridge, "MU2000 起動中");
 
@@ -329,9 +388,25 @@ void engine::boot()
 		return;
 	}
 
+	// Run past midi_ready until the firmware settles: at midi_ready the LCD
+	// still shows the mid-boot transient, and that frame is what the snapshot
+	// keeps. A host that never renders would show the restored transient
+	// forever, so only save once the steady screen is up
+	for (int64_t j = 0; j < int64_t(2.0 * NATIVE_RATE); j++) {
+		if (!(j & 4095) && m_abort.load(std::memory_order_relaxed)) {
+			delete mu;
+			return;
+		}
+		s32 l = 0, r = 0;
+		mu->run_sample(l, r);
+	}
+
 	const double wall = std::chrono::duration<double>(
 	    std::chrono::steady_clock::now() - t0).count();
 	logf("起動: 音 %.2f 秒ぶん / 実時間 %.2f 秒", double(i) / NATIVE_RATE, wall);
+	// 次からはここまでを飛ばせるように残す
+	if (bootcache::save(*mu, boot_key))
+		logf("起動の写しを残した: %s", bootcache::path(boot_key).c_str());
 
 	m_mu = mu;
 	m_message = warn.empty() ? std::string("ROM: ") + dir
@@ -406,7 +481,8 @@ void engine::one_sample(float &l, float &r)
 
 void engine::midi(const uint8_t *bytes, size_t n, int port)
 {
-	port = port == 1 ? 1 : 0;
+	if (port < 0 || port >= mu2000::MIDI_PORTS)
+		port = 0;
 	const status s = state();
 	if (s == status::failed)
 		return;
@@ -414,29 +490,27 @@ void engine::midi(const uint8_t *bytes, size_t n, int port)
 		std::unique_lock<std::mutex> lock(m_machine, std::try_to_lock);
 		if (lock.owns_lock()) {
 			// 溜まっていた分を先に流して、順番を保つ
-			for (uint8_t b : m_pending[port]) {
-				m_mu->midi_in(b, port);
-				m_drv.watch(b, port);
-			}
+			for (uint8_t b : m_pending[port])
+				m_drv.watch(b, m_mu->midi_in(b, port));
 			m_pending[port].clear();
-			for (size_t i = 0; i < n; i++) {
-				m_mu->midi_in(bytes[i], port);
-				m_drv.watch(bytes[i], port);
-			}
+			for (size_t i = 0; i < n; i++)
+				m_drv.watch(bytes[i], m_mu->midi_in(bytes[i], port));
 			return;
 		}
 	}
-	// 起動待ちか、機械を他が使っている。あふれるようなら捨てる
+	// 起動待ちか、機械を他が使っている。あふれるようなら捨てる（上限は機械の溜めと同じ。mu2000.h）
 	std::vector<uint8_t> &pending = m_pending[port];
-	if (pending.size() + n > 65536)
+	if (pending.size() + n > mu2000::MIDI_QUEUE_LIMIT)
 		return;
 	pending.insert(pending.end(), bytes, bytes + n);
 }
 
-void engine::all_notes_off()
+void engine::all_notes_off(const uint16_t *mask, int ports)
 {
-	for (int port = 0; port < 2; port++)
+	for (int port = 0; port < ports && port < mu2000::MIDI_PORTS; port++)
 		for (int ch = 0; ch < 16; ch++) {
+			if (!((mask[port] >> ch) & 1))
+				continue;
 			const uint8_t msg[6] = { uint8_t(0xb0 | ch), 120, 0,
 			                         uint8_t(0xb0 | ch), 123, 0 };
 			midi(msg, sizeof(msg), port);
@@ -476,6 +550,28 @@ void engine::push_input(const float *in_l, const float *in_r, int n)
 	}
 }
 
+// Holds what pump_out() hands over. On overflow the oldest byte goes
+void engine::tx_push(uint8_t v)
+{
+	const int next = (m_tx_w + 1) & TX_MASK;
+	if (next == m_tx_r)
+		m_tx_r = (m_tx_r + 1) & TX_MASK;
+	m_tx[m_tx_w] = v;
+	m_tx_w = next;
+}
+
+size_t engine::midi_out(uint8_t *dst, size_t max)
+{
+	if (!dst || !max)
+		return 0;
+	size_t n = 0;
+	while (n < max && m_tx_r != m_tx_w) {
+		dst[n++] = m_tx[m_tx_r];
+		m_tx_r = (m_tx_r + 1) & TX_MASK;
+	}
+	return n;
+}
+
 void engine::fill(float *left, float *right, int n, const float *in_l, const float *in_r)
 {
 	if (n <= 0)
@@ -496,18 +592,17 @@ void engine::fill(float *left, float *right, int n, const float *in_l, const flo
 	m_drv.pump_midi(*m_mu, m_bridge);
 	m_drv.pump_wheel(*m_mu, m_bridge);
 
-	for (int port = 0; port < 2; port++) {
-		for (uint8_t b : m_pending[port]) {
-			m_mu->midi_in(b, port);
-			m_drv.watch(b, port);
-		}
+	// 起動を待つ間に溜めた分。口 C・D も（前は A・B しか流さず、C・D はその口に次の MIDI が来るまで残っていた）
+	for (int port = 0; port < mu2000::MIDI_PORTS; port++) {
+		for (uint8_t b : m_pending[port])
+			m_drv.watch(b, m_mu->midi_in(b, port));
 		m_pending[port].clear();
 	}
 
 	if (m_direct) {
 		for (int i = 0; i < n; i++)
 			one_sample(left[i], right[i]);
-		m_drv.pump_out(*m_mu, m_bridge);
+		m_drv.pump_out(*m_mu, m_bridge, [this](u8 v) { tx_push(v); });
 		m_drv.publish(*m_mu, m_bridge, u32(n), u32(NATIVE_RATE), true, nullptr);
 		return;
 	}
@@ -544,7 +639,7 @@ void engine::fill(float *left, float *right, int n, const float *in_l, const flo
 	}
 
 	// firmware が MIDI OUT から送り出したもの（画面の問い合わせの返事）
-	m_drv.pump_out(*m_mu, m_bridge);
+	m_drv.pump_out(*m_mu, m_bridge, [this](u8 v) { tx_push(v); });
 	m_drv.publish(*m_mu, m_bridge, u32(n), u32(NATIVE_RATE), true, nullptr);
 
 	// 桁が落ちる前に原点を戻す。RING の倍数だけずらせば環の並びは変わらない
@@ -563,13 +658,32 @@ void engine::fill(float *left, float *right, int n, const float *in_l, const flo
 
 void engine::apply_deferred_state()
 {
-	if (m_deferred_state.empty() || state() != status::ready || !m_mu)
+	if (!m_deferred || state() != status::ready || !m_mu)
 		return;
-	std::string err;
-	if (!m_mu->load_state(m_deferred_state.data(), m_deferred_state.size(), err))
-		log_line(("状態を読み戻せない: " + err).c_str());
+	restore(m_deferred_state.data(), m_deferred_state.size(), m_deferred_setup);
+	m_deferred = false;
 	m_deferred_state.clear();
 	m_deferred_state.shrink_to_fit();
+	m_deferred_setup.clear();
+	m_deferred_setup.shrink_to_fit();
+}
+
+bool engine::restore(const uint8_t *p, size_t n, const std::vector<uint8_t> &setup)
+{
+	std::string err = "機械まるごとの状態が入っていない";
+	if (p && n && m_mu->load_state(p, n, err))
+		return true;
+	if (p && n)
+		log_line(("状態を読み戻せない: " + err).c_str());
+	if (setup.empty())
+		return false;
+	// XG の値の控えを MIDI IN A に流す。音色とエフェクトの設定はこれで戻る
+	char line[160];
+	std::snprintf(line, sizeof(line), "代わりに XG の値の控え（%zu バイト）を流して戻す", setup.size());
+	log_line(line);
+	for (uint8_t b : setup)
+		m_drv.watch(b, m_mu->midi_in(b, 0));
+	return true;
 }
 
 std::vector<uint8_t> engine::save_state()
@@ -583,23 +697,69 @@ std::vector<uint8_t> engine::save_state()
 	return m_mu->save_state();
 }
 
-bool engine::load_state(const uint8_t *p, size_t n)
+std::vector<uint8_t> engine::save_xg_setup()
 {
-	if (!p || !n)
+	std::lock_guard<std::mutex> lock(m_machine);
+	if (state() != status::ready || !m_mu)
+		return m_deferred_setup;
+	apply_deferred_state();
+	// 写しは大きい（パート 64 × 256 バイト）ので、この糸の積みには置かない
+	std::unique_ptr<ui::xg_snapshot> ram(new ui::xg_snapshot);
+	ui::driver::copy_xg(*m_mu, *ram);
+	return ui::setup_messages(*ram);
+}
+
+bool engine::load_state(const uint8_t *p, size_t n, const uint8_t *setup, size_t setup_n)
+{
+	if ((!p || !n) && (!setup || !setup_n))
 		return false;
 	std::lock_guard<std::mutex> lock(m_machine);
 	if (state() == status::failed)
 		return false;
+	const std::vector<uint8_t> fallback = setup && setup_n ? std::vector<uint8_t>(setup, setup + setup_n)
+	                                                       : std::vector<uint8_t>();
 	if (state() != status::ready || !m_mu) {
-		m_deferred_state.assign(p, p + n);
+		m_deferred_state.assign(p, p + (p ? n : 0));
+		m_deferred_setup = fallback;
+		m_deferred = true;
 		return true;
 	}
+	m_deferred = false;
 	m_deferred_state.clear();
-	std::string err;
-	const bool ok = m_mu->load_state(p, n, err);
-	if (!ok)
-		log_line(("状態を読み戻せない: " + err).c_str());
-	return ok;
+	m_deferred_setup.clear();
+	return restore(p, n, fallback);
+}
+
+
+// ---- 画面で値を触ったことを、プラグインの口へ知らせる
+
+void engine::set_edit_handlers(edit_fn edit, idle_fn idle, raw_fn raw)
+{
+	std::lock_guard<std::mutex> lock(m_hook_mutex);
+	m_on_edit = std::move(edit);
+	m_on_idle = std::move(idle);
+	m_on_raw = std::move(raw);
+}
+
+void engine::notify_edit_raw(u32 addr, int size, int value)
+{
+	std::lock_guard<std::mutex> lock(m_hook_mutex);
+	if (m_on_raw)
+		m_on_raw(addr, size, value);
+}
+
+void engine::notify_edit(const xg::param &p, int part, int value)
+{
+	std::lock_guard<std::mutex> lock(m_hook_mutex);
+	if (m_on_edit)
+		m_on_edit(p, part, value);
+}
+
+void engine::notify_idle(bool closing)
+{
+	std::lock_guard<std::mutex> lock(m_hook_mutex);
+	if (m_on_idle)
+		m_on_idle(closing);
 }
 
 

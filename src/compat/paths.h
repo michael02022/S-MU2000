@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -38,8 +39,13 @@
 #  endif
 #  include <windows.h>
 #else
+#  include <dirent.h>
 #  include <dlfcn.h>
-#  include <mach-o/dyld.h>
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h>
+#  else
+#    include <unistd.h>
+#  endif
 #  include <sys/stat.h>
 #  include <climits>
 #  include <cstdlib>
@@ -69,6 +75,13 @@ inline std::string exe_dir()
 	if (n == 0 || n >= MAX_PATH)
 		return {};
 	return detail::dir_of(std::string(buf, n));
+#elif !defined(__APPLE__)
+	// Linux: the kernel keeps the running binary's path here, symlinks resolved
+	char real[PATH_MAX] = {};
+	const ssize_t n = ::readlink("/proc/self/exe", real, sizeof(real) - 1);
+	if (n <= 0)
+		return {};
+	return detail::dir_of(std::string(real, size_t(n)));
 #else
 	// _NSGetExecutablePath may hand back a path with symlinks in it, so resolve
 	// it before taking the directory: argv[0]-style paths are not enough once
@@ -94,6 +107,15 @@ inline std::string config_dir()
 	if (!base || !*base)
 		return {};
 	return std::string(base) + "\\S-MU2000\\";
+#elif !defined(__APPLE__)
+	// Linux: where the desktop specification (XDG) puts a program's own data
+	const char *data = std::getenv("XDG_DATA_HOME");
+	if (data && *data)
+		return std::string(data) + "/S-MU2000/";
+	const char *home = std::getenv("HOME");
+	if (!home || !*home)
+		return {};
+	return std::string(home) + "/.local/share/S-MU2000/";
 #else
 	const char *home = std::getenv("HOME");
 	if (!home || !*home)
@@ -114,6 +136,7 @@ inline std::string config_dir()
 // It is only ever read.
 //
 // macOS:   /Library/Application Support/S-MU2000
+// Linux:   /usr/local/share/S-MU2000
 // Windows: %ProgramData%\S-MU2000
 inline std::string shared_config_dir()
 {
@@ -122,6 +145,8 @@ inline std::string shared_config_dir()
 	if (!base || !*base)
 		return {};
 	return std::string(base) + "\\S-MU2000\\";
+#elif !defined(__APPLE__)
+	return "/usr/local/share/S-MU2000/";
 #else
 	return "/Library/Application Support/S-MU2000/";
 #endif
@@ -190,6 +215,47 @@ inline bool is_dir(const std::string &p)
 	struct stat st{};
 	return ::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 #endif
+}
+
+// S-MU2000: そのディレクトリの中のファイルを、名前と最終更新の組で並べる。
+// ディレクトリそのものは入れない。古いものを間引くために使う（bootcache.h）
+struct dir_entry { std::string name; unsigned long long mtime; };
+
+inline std::vector<dir_entry> list_dir(const std::string &dir)
+{
+	std::vector<dir_entry> out;
+	if (dir.empty())
+		return out;
+#if defined(_WIN32)
+	WIN32_FIND_DATAA fd{};
+	const HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return out;
+	do {
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+		const unsigned long long t =
+			((unsigned long long)(fd.ftLastWriteTime.dwHighDateTime) << 32) |
+			fd.ftLastWriteTime.dwLowDateTime;
+		out.push_back({ fd.cFileName, t });
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+#else
+	DIR *d = ::opendir(dir.c_str());
+	if (!d)
+		return out;
+	while (const struct dirent *e = ::readdir(d)) {
+		const std::string name = e->d_name;
+		if (name == "." || name == "..")
+			continue;
+		struct stat st{};
+		if (::stat((dir + "/" + name).c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+			continue;
+		out.push_back({ name, (unsigned long long)st.st_mtime });
+	}
+	::closedir(d);
+#endif
+	return out;
 }
 
 // One directory level, no parents. Already existing counts as success

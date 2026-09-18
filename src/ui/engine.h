@@ -25,7 +25,9 @@
 #include "midi_guard.h"
 #include "midi_in.h"
 #include "midi_out.h"
+#include "analog_out.h"
 #include "mu2000.h"
+#include "bootcache.h"
 #include "nvram.h"
 
 #include "compat/platform.h"
@@ -43,7 +45,9 @@ struct engine {
 	mu2000 mu;
 	bridge   &br;
 	midi_in  &midi;        // MIDI IN A（パート 1-16）
-	midi_in  *midi_b = nullptr;   // MIDI IN B（パート 17-32）
+	// B-D。B は実機の 2 つめの DIN、C・D は USB だけの口（パート 33-64）。
+	// [0] は使わない（midi が A）
+	midi_in  *midi_p[mu2000::MIDI_PORTS] = {};
 	midi_out *mout = nullptr;     // MIDI THRU A（A で受けたものを外へ）
 	midi_out *mout_b = nullptr;   // MIDI THRU B（B で受けたものを外へ）
 	// MIDI OUT。MU2000 が自分で送り出すもの（XG のダンプ要求への返事など）。
@@ -59,6 +63,12 @@ struct engine {
 	// SmartMedia を差す・抜く・書き戻す間は、音声の糸が機械を回さないようにする
 	std::mutex card_lock;
 	bool use_nvram = false;           // 覚えている設定で起動するか（窓を出すときだけ）
+	// 音の出口。false = デジタル（S/PDIF と同じ。DPCM の直流も残る）、true = アナログ（直流を切る。analog_out.h）
+	std::atomic<bool> analog{false};
+	// エフェクトを C++ で鳴らす軽量モード（doc/native-dsp.md）。0 切 / 1 / 2。
+	// 画面からはここへ頼むだけで、切り替えは音声の糸が fill() の頭で行う
+	std::atomic<int>  want_native_fx{-1};
+	std::atomic<int>  native_fx{0};
 	std::string      message = "起動中...";
 
 	driver drv;
@@ -83,7 +93,17 @@ struct engine {
 		mu.set_threaded(true);
 		if (use_nvram && smu2000::nvram::load(mu))
 			std::printf("設定: %s\n", smu2000::nvram::path(mu).c_str());
+		// 鍵は起動に使うワーク RAM も混ぜるので、reset() の前に作る
+		const u64 key = smu2000::bootcache::key(mu);
 		mu.reset();
+		// 前に起動し切った姿を取ってあれば、そこから始める（bootcache.h）。
+		// 回した結果と 1 ビットも違わないので、音は同じ。
+		// **reset() のあとで読むこと**（タイマが揃っていないと形が合わない）
+		if (smu2000::bootcache::load(mu, key)) {
+			std::printf("起動: 前の写しから（%s）\n", smu2000::bootcache::path(key).c_str());
+			publish();
+			return true;
+		}
 		const size_t limit = size_t(30.0 * AUDIO_RATE);
 		size_t i = 0;
 		s32 l, r;
@@ -93,6 +113,8 @@ struct engine {
 			message = "起動しなかった";
 			return false;
 		}
+		if (smu2000::bootcache::save(mu, key))
+			std::printf("起動の写しを残した: %s\n", smu2000::bootcache::path(key).c_str());
 		publish();
 		return true;
 	}
@@ -147,6 +169,12 @@ struct engine {
 			return;
 		}
 
+		// 軽量モードの切り替えは、機械を回していない今のうちに
+		if (const int want = want_native_fx.exchange(-1); want >= 0) {
+			mu.set_native_fx(want);
+			native_fx.store(want);
+		}
+
 		guard_a.refill(n, AUDIO_RATE);
 		guard_b.refill(n, AUDIO_RATE);
 
@@ -157,22 +185,29 @@ struct engine {
 
 		u8 b;
 		while (midi.pop(b)) {
-			mu.midi_in(b, 0);
-			drv.watch(b, 0);
+			drv.watch(b, mu.midi_in(b, 0));
 			if (mout && guard_a.pass(b)) mout->send(b);
 		}
 		// B は実機の 2 つめの DIN（内蔵 SCI ch1）。パート 17-32 に届く。
 		// THRU も口ごとに分ける。A で受けたものは MIDI OUT A、
 		// B で受けたものは MIDI OUT B へ。混ぜると、外に繋いだ音源で
 		// パートの割り振りが崩れる
-		if (midi_b)
-			while (midi_b->pop(b)) {
-				mu.midi_in(b, 1);
-				drv.watch(b, 1);
-				if (mout_b && guard_b.pass(b)) mout_b->send(b);
+		// C・D は実機では USB だけの口で、外へ出す THRU の端子も無い
+		for (int p = 1; p < mu2000::MIDI_PORTS; p++) {
+			if (!midi_p[p])
+				continue;
+			while (midi_p[p]->pop(b)) {
+				drv.watch(b, mu.midi_in(b, p));
+				if (p == 1 && mout_b && guard_b.pass(b)) mout_b->send(b);
 			}
+		}
 
 		const float g = br.gain();
+		// アナログにした最初のブロックで、前に使ったときの状態を捨てる
+		const bool to_analog = analog.load(std::memory_order_relaxed);
+		if (to_analog && !m_analog_was)
+			m_dc.reset();
+		m_analog_was = to_analog;
 
 		for (u32 i = 0; i < n; i++) {
 			s32 l = 0, r = 0;
@@ -182,6 +217,11 @@ struct engine {
 				mu.set_audio_input(a1, a2);
 			}
 			mu.run_sample(l, r);
+			// 直流を切るのは音量のつまみより前（DAC のすぐ後ろ）。デジタルのときは何もしない
+			if (to_analog) {
+				l = s32(std::lrint(m_dc.run(0, l)));
+				r = s32(std::lrint(m_dc.run(1, r)));
+			}
 			l = s32(l * g) * 32768 / mu2000::DAC_FULL_SCALE;
 			r = s32(r * g) * 32768 / mu2000::DAC_FULL_SCALE;
 			out[i * 2 + 0] = s16(l < -32768 ? -32768 : l > 32767 ? 32767 : l);
@@ -195,6 +235,10 @@ struct engine {
 		drv.publish(mu, br, n, AUDIO_RATE, true, nullptr);
 		in_fill.store(false);
 	}
+
+private:
+	smu2000::analog_out m_dc{ AUDIO_RATE };
+	bool m_analog_was = false;
 };
 
 } // namespace ui

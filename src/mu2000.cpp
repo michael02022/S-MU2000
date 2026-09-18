@@ -4,6 +4,14 @@
 
 #include "mu2000.h"
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#include <pmmintrin.h>
+#endif
+
+#include "xg/ram.h"
+#include "xg/fx_params.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +25,9 @@ namespace {
 
 // MIDI は 31250bps。28MHz の CPU から見て 1 ビット = 896 サイクル
 constexpr u64 MIDI_BIT_CYCLES = 28000000 / 31250;
+
+// USB は実機で 19,500 byte/s 出た（doc/dump/usb.md）。1 バイトぶんのサイクル数
+constexpr u64 USB_BYTE_CYCLES = 28000000 / 19500;
 
 bool read_file(const std::string &path, std::vector<u8> &out, size_t expect)
 {
@@ -416,16 +427,20 @@ void mu2000::build_bus()
 	// 800000-801fff: SWP30 マスタ / 802000-803fff: スレーブ。
 	// レジスタは 16bit 単位なので、番地を 2 で割って渡す
 	auto swp = [this](swp30_device &dev, u32 base) {
-		// 実機のマスタの SWP30 は、書き込みを 1 サンプルに 1 回しか受け取れないらしく、書くたびに CPU は
-		// 次のサンプルの区切りまで待たされる（BSC の WAIT）。遅れて鳴る層（firmware が 2.5ms ごとに数を
-		// 減らして鍵を押す）の遅れが、これで実機と音ごとに ±10 サンプルで合う。待たせないと、音の設定の
-		// 書き込み百回ほどが一瞬で終わり、実機より約 64 サンプル長くなっていた。
+		// 実機のマスタの SWP30 へ書くと、CPU は 1 本あたり **440 サイクル**（15.7 マイクロ秒、
+		// 1 サンプルの 0.69 ぶん）待たされる（BSC の WAIT）。書き込み百回ほどが一瞬で終わる形にすると、
+		// 遅れて鳴る層の遅れが実機より約 64 サンプル短くなる。
+		//
+		// 440 という数は実機から直に測った。XG モードでパート 1 と 2 を同じ受信チャンネルにして
+		// 1 つのノートオンで鳴らし、左右へ振ると、左右の立ち上がりの差がそのまま
+		// 「firmware が 1 パートぶんのレジスタを書く時間」になる（キーオンの間の待つ書き込みは 68 本）。
+		// 実機 61.4 サンプル（8 音、標準偏差 1.0）に対し、この値で 61.1（doc/upstream.md の 36）。
+		//
 		// スレーブは待たせない（2.4kHz の割り込みが毎回ミキサを 7 つ書くので、待たせると CPU の 4 割が
 		// 止まる。待たせると遅れが実機より 10 サンプル余計に長くなり、SLICE の位相も遠ざかる）。
 		// 制御の 2 つ（0x0e / 0x0f）は、中身を書くもの（MEG のプログラムの中身 = チャンネル 0x11・0x12、
 		// リバーブ RAM へ直に書く中身 = 0x26）だけ待たせ、番地・合図・状態は待たせない。エフェクトの種類を
-		// 替えたときの読み込みの時間が、これで実機と合う（SLICE は表を 2052 項目書くので実機で 62ms 長い。
-		// 刻みの位相もこれで合う。doc/upstream.md の 36）
+		// 替えたときの読み込みの時間が、これで実機と合う（SLICE は表を 2052 項目書くので実機で 62ms 長い）
 		const bool waits = base == 0x800000;
 		auto hold = [this, waits](offs_t reg) {
 			const u32 slot = reg & 0x3f;
@@ -433,7 +448,7 @@ void mu2000::build_bus()
 			const bool control = slot == 0x0e || slot == 0x0f;
 			const bool data = chan == 0x11 || chan == 0x12 || chan == 0x26;
 			if (waits && (!control || data)) {
-				m_swp_hold = true;
+				m_swp_wait += SWP_WRITE_CYCLES;
 				m_cpu->abort_timeslice();
 			}
 		};
@@ -443,7 +458,7 @@ void mu2000::build_bus()
 		d.r16 = [this, &dev, base](offs_t a) {
 			const u16 v = dev.read16((a - base) >> 1);
 			if (m_swp_trace && m_swp_trace_reads)
-				std::fprintf(m_swp_trace, "R %08x %04x %04x  pc=%08x\n", base, (a - base) >> 1, v, m_cpu->pc());
+				std::fprintf(m_swp_trace, "R %08x %04x %04x  pc=%08x  t=%.6f\n", base, (a - base) >> 1, v, m_cpu->pc(), double(m_cpu->total_cycles()) / 28000000.0);
 			return v;
 		};
 		// 幅の内訳を数える。MAME は 16bit ハンドラに mem_mask を渡せるが
@@ -464,10 +479,10 @@ void mu2000::build_bus()
 			m_swp_w32++;
 			const offs_t reg = (a - base) >> 1;
 			if (m_swp_trace) {
-				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x\n",
-				             m_swp_trace_reads ? "W " : "", base, reg, u16(v >> 16), m_cpu->pc());
-				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x\n",
-				             m_swp_trace_reads ? "W " : "", base, reg + 1, u16(v), m_cpu->pc());
+				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x  t=%.6f\n",
+				             m_swp_trace_reads ? "W " : "", base, reg, u16(v >> 16), m_cpu->pc(), double(m_cpu->total_cycles()) / 28000000.0);
+				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x  t=%.6f\n",
+				             m_swp_trace_reads ? "W " : "", base, reg + 1, u16(v), m_cpu->pc(), double(m_cpu->total_cycles()) / 28000000.0);
 			}
 			dev.write16(reg, u16(v >> 16));
 			dev.write16(reg + 1, u16(v));
@@ -476,8 +491,8 @@ void mu2000::build_bus()
 		d.w16 = [this, &dev, base, hold](offs_t a, u16 v) {
 			m_swp_w16++;
 			if (m_swp_trace)
-				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x\n",
-				             m_swp_trace_reads ? "W " : "", base, (a - base) >> 1, v, m_cpu->pc());
+				std::fprintf(m_swp_trace, "%s%08x %04x %04x  pc=%08x  t=%.6f\n",
+				             m_swp_trace_reads ? "W " : "", base, (a - base) >> 1, v, m_cpu->pc(), double(m_cpu->total_cycles()) / 28000000.0);
 			dev.write16((a - base) >> 1, v);
 			hold((a - base) >> 1);
 		};
@@ -524,6 +539,16 @@ void mu2000::build_bus()
 		d.start = 0xf00000; d.end = 0xf0003f;
 		d.r8 = [this](offs_t a) { return m_sci4->read8(a - 0xf00000); };
 		d.w8 = [this](offs_t a, u8 v) { m_sci4->write8(a - 0xf00000, v); };
+		m_bus.add_device(d);
+	}
+
+	// f80000-f80001: USB の M37640 マイコン。SH-2 から見えるのはこの 2 番地だけ。
+	// 読みは 0 が受信バイト、1 が状態。書きは 0 が MIDI、1 が M37640 への指示
+	{
+		mem_bus::device d;
+		d.start = 0xf80000; d.end = 0xf80001;
+		d.r8 = [this](offs_t a) { return usb_r(a - 0xf80000); };
+		d.w8 = [this](offs_t a, u8 v) { usb_w(a - 0xf80000, v); };
 		m_bus.add_device(d);
 	}
 
@@ -587,6 +612,21 @@ void mu2000::start_devices()
 
 void mu2000::reset()
 {
+	// 実機の M37640 は、PC に繋がっていると「ホストが居る」を知らせてくる
+	// （状態の bit6 を立てて F4 03 01 01 01。0x43810 が受け、0x43DAD1 を 1 にする）。
+	// これが来ないと、HOST SELECT が USB のとき firmware は起動の途中（0x1167CE）で
+	// 液晶に「HOST Is Offline!」を出す。エミュでは PC が常に繋がっているので、起動時に 1 回送る
+	m_usb.cmd.clear();
+	m_usb.cur_cmd = false;
+	// ケーブルメッセージで回した口は、電源を入れ直せば元に戻る
+	for (int p = 0; p < MIDI_PORTS; p++) {
+		m_cable[p] = p;
+		m_cable_wait[p] = false;
+	}
+	if (m_usb_host)
+		for (u8 b : { 0xf4, 0x03, 0x01, 0x01, 0x01 })
+			m_usb.cmd.push_back(b);
+
 	// ポート A。MAME の mu500_state::pa_r は 0xffff を返すだけだったが、
 	// そこに付いていた覚え書きに配線が書いてある。
 	//   21 出力（前面と背面の MIDI A を切り替える）
@@ -635,7 +675,9 @@ void mu2000::reset()
 	m_cpu->read_adc<1>().set_constant(0);
 	m_cpu->read_adc<2>().set([this]() { return ad_level_adc(1); });
 	m_cpu->read_adc<3>().set_constant(0);
-	m_cpu->read_adc<4>().set_constant(0);        // ホストスイッチ = MIDI
+	// ホストスイッチ。firmware は 8 ビットに落として境で分ける（0x1098）。
+	// 0x20 未満が MIDI、0xBA-0xE0 が USB
+	m_cpu->read_adc<4>().set([this]() -> u16 { return m_usb_host ? 0x330 : 0; });
 	m_cpu->read_adc<5>().set_constant(0);
 	m_cpu->read_adc<6>().set_constant(0x3ff);    // 電池は満タン
 	m_cpu->read_adc<7>().set_constant(0);
@@ -711,6 +753,7 @@ void mu2000::run_cycles(u64 n)
 
 		// MIDI のビット送出も跨がないように
 		midi_step(now);
+		usb_step(now);
 
 		u64 chunk = n;
 		if (ev && ev - now < chunk)
@@ -724,11 +767,13 @@ void mu2000::run_cycles(u64 n)
 					if (left < chunk)
 						chunk = left;
 				}
-		// SWP30 に書いた後は、このサンプルの残りを命令を進めずに過ごす（上の swp の説明）。
+		// SWP30 に書いた後は、その待ちぶんだけ命令を進めずに時間を送る（上の swp の説明）。
 		// 周辺のタイマや MIDI の送出は、区切りごとにここまでで進めている
-		if (m_swp_hold) {
-			m_cpu->skip_cycles(chunk);
-			n = chunk >= n ? 0 : n - chunk;
+		if (m_swp_wait) {
+			const u64 skip = std::min<u64>(m_swp_wait, chunk);
+			m_cpu->skip_cycles(skip);
+			m_swp_wait -= skip;
+			n = skip >= n ? 0 : n - skip;
 			continue;
 		}
 
@@ -746,7 +791,6 @@ void mu2000::run_cycles(u64 n)
 		} else
 			n -= u64(done);
 	}
-	m_swp_hold = false;
 }
 
 // ダイヤルを 1 位相ぶん進める。
@@ -778,10 +822,116 @@ void mu2000::tx_line(int state)
 	m_tx_w = next;
 }
 
+// ---- USB（M37640）の代役
+//
+// 溜めに積むときに口が変わっていれば `F5 <口>` を先に挟む。firmware 側は
+// 0x042932 で 0xF5 を見て次のバイトを「今の口」として覚え、以後のバイトを
+// その口として 0x04437C へ渡す。口は 1 始まり（1=A 2=B 3=C 4=D）
+
+void mu2000::usb_midi_in(u8 byte, int port)
+{
+	usb_line &u = m_usb;
+	if (u.rx.size() >= MIDI_QUEUE_LIMIT) {
+		m_midi_dropped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (port != u.in_port) {
+		u.rx.push_back(0xf5);
+		u.rx.push_back(u8(port + 1));
+		u.in_port = port;
+	}
+	u.rx.push_back(byte);
+}
+
+void mu2000::usb_step(u64 now)
+{
+	usb_line &u = m_usb;
+
+	// USB を使っていないときは何もしない。割り込みを上げると firmware の
+	// USB ドライバが動き出してしまう
+	if (!m_usb_host && u.rx.empty() && !u.have)
+		return;
+
+	// 受信。1 バイト渡すごとに IRQ3（ベクタ 67）を上げる。
+	// 間隔は実機で測った USB の実効帯域 19,500 byte/s に合わせる
+	// （doc/dump/usb.md の実測）。DIN の 3,125 byte/s より 6 倍速いが、
+	// 発音の間隔は firmware 側が頭打ちなので実測とは食い違わない。
+	// 4 つの口が 1 本の流れを分け合うので、遅くすると互いに待たせてしまう
+	if (!u.have && now >= u.next && (!u.cmd.empty() || !u.rx.empty())) {
+		// コマンドを先に渡す
+		std::deque<u8> &q = u.cmd.empty() ? u.rx : u.cmd;
+		u.cur_cmd = !u.cmd.empty();
+		u.cur  = q.front();
+		u.have = true;
+		q.pop_front();
+		u.next = now + (m_fast_midi ? 0 : USB_BYTE_CYCLES);
+	}
+	// 送信の線を一度下ろす。下で上げ直すので、山は 1 標本ぶんになる
+	m_cpu->execute_set_input(2, 0);
+	// **読まれるまで上げておく**。実機の M37640 は「受信あり」を線で示しているので、
+	// firmware が受け取りを止めている間に来たバイトも、止めるのをやめた時点で必ず拾われる。
+	// 渡した瞬間に 1 回だけ上げる形にしていたため、firmware が受信を詰まらせて
+	// IRQ3 の優先度を 0 に落としている隙に渡すと、優先度を戻しても二度と上がらず、
+	// 以後 MIDI を 1 バイトも受け取らなくなっていた（USB の口へ 1 秒に 2 万バイト近い
+	// 設定データを流すと起きる。X で報告された testxg.mid）
+	if (u.have)
+		m_cpu->execute_set_input(3, 1);
+
+	// 送信。firmware は IRQ2（ベクタ 66）が来るたびに 1 バイト出す。
+	// 上げないとリングが埋まり、0x437A0 の空き待ちで固まる（実機でやらかした）
+	if (now >= u.tx_next) {
+		u.tx_next = now + USB_BYTE_CYCLES;
+		m_cpu->execute_set_input(2, 1);
+	}
+}
+
+u8 mu2000::usb_r(offs_t a)
+{
+	usb_line &u = m_usb;
+	if (a & 1)
+		return u.have ? (u.cur_cmd ? 0x41 : 0x01) : 0x00;   // bit0 = 受信あり、bit6 = コマンド
+	// 受け取られたのでその場で線を下ろす。次の標本まで待つと、その隙に
+	// 割り込みがもう一度入って同じバイトを二度読まれてしまう
+	u.have = false;
+	m_cpu->execute_set_input(3, 0);
+	return u.cur;
+}
+
+void mu2000::usb_w(offs_t a, u8 v)
+{
+	if (a & 1)
+		return;                        // コマンド口。M37640 への指示なので捨てる
+	usb_line &u = m_usb;
+	if (u.tx.size() < TX_SIZE)
+		u.tx.push_back(v);
+}
+
+bool mu2000::usb_out_take(u8 &v, int &port)
+{
+	usb_line &u = m_usb;
+	while (!u.tx.empty()) {
+		const u8 b = u.tx.front();
+		u.tx.pop_front();
+		if (b == 0xf5) {
+			if (u.tx.empty()) {        // 口の番号がまだ来ていない。戻しておく
+				u.tx.push_front(b);
+				return false;
+			}
+			u.out_port = int(u.tx.front()) - 1;
+			u.tx.pop_front();
+			continue;
+		}
+		v = b;
+		port = u.out_port;
+		return true;
+	}
+	return false;
+}
+
 void mu2000::midi_step(u64 now)
 {
 	// A と B は別々の SCI に繋がっている。互いに待たせない
-	for (int port = 0; port < MIDI_PORTS; port++) {
+	for (int port = 0; port < MIDI_DIN_PORTS; port++) {
 		midi_line &m = m_midi[port];
 		sh_sci_device *sci = m_cpu->sci(port);
 		if (m_fast_midi) {
@@ -824,8 +974,158 @@ void mu2000::midi_step(u64 now)
 }
 
 
+// S-MU2000: 軽量モードの入り切り（doc/native-dsp.md）
+void mu2000::set_native_fx(int mode)
+{
+	m_nfx_on = mode;
+	// 遅延の線は作り直さない（音声の糸が読んでいる最中に切り替えても危なくないように）。
+	// 大きさは 44100Hz ぶんで固定なので、1 度用意すれば足りる
+	static bool ready = false;
+	// 軽量モードは float で計算する。非正規化数（0 に近すぎる値）が出ると命令が何十倍も遅くなるので、
+	// この糸では 0 に丸める（FTZ/DAZ）
+#if defined(__SSE2__) || defined(_M_X64) || defined(__x86_64__)
+	if (mode)
+		_mm_setcsr(_mm_getcsr() | 0x8040);
+#endif
+	if (!ready) {
+		m_nfx.set_rate(44100.0f);
+		ready = true;
+	}
+	m_nfx.reset();
+	int mask = 15;
+	if (const char *e = std::getenv("SMU2000_NATIVE_SLOTS"))
+		mask = std::atoi(e);
+	m_swpm.set_native_fx(mode ? &m_nfx : nullptr, mode >= 2, mask);
+	if (mode)
+		native_fx_update();
+}
+
+namespace {
+
+// XG の番地から、ワーク RAM の値を読む（7bit ずつ。無ければ -1）
+int xg_read(const std::vector<u8> &ram, int hi, int mid, int lo, int size)
+{
+	int v = 0;
+	for (int i = 0; i < size; i++) {
+		u32 off = 0;
+		if (!xg::ram::locate(u32(hi << 14 | mid << 7 | (lo + i)), off) || off >= ram.size())
+			return -1;
+		v = (v << 7) | (ram[off] & 0x7f);
+	}
+	return v;
+}
+
+// インサーション n のパラメータ 1-10 が 2 バイトの種類のときの値（16bit がそのまま並ぶ）
+int ins_wide(const std::vector<u8> &ram, int n, int addr)
+{
+	const u32 off = xg::ram::INS_BLOCK[n] + xg::ram::INS_WIDE + u32(2 * (addr - 0x30));
+	if (off + 1 >= ram.size())
+		return -1;
+	return ram[off] << 8 | ram[off + 1];
+}
+
+} // namespace
+
+// RAM に入っている XG の設定を読んで、C++ のエフェクトに渡す。
+// 音を作る糸から 512 サンプルごとに呼ぶ（設定はそんなに速く変わらない）
+void mu2000::native_fx_update()
+{
+	using nfx = smu2000::dsp::native_fx;
+	const std::vector<u8> &ram = m_ram;
+	if (ram.size() < 0x30000)
+		return;
+
+	struct slot_def { nfx::slot_id id; int hi, mid, base, ret_lo, ins; };
+	static const slot_def SLOTS[] = {
+		{ nfx::REVERB,    0x02, 0x01, 0x00, 0x0c, -1 },
+		{ nfx::CHORUS,    0x02, 0x01, 0x20, 0x2c, -1 },
+		{ nfx::VARIATION, 0x02, 0x01, 0x40, 0x56, -1 },
+		{ nfx::INS1,      0x03, 0x00, 0x00, -1,    0 },
+	};
+
+	// パラメータの並びは、置き場ごとに違う（表の addr はインサーションの番地）。
+	//   リバーブ・コーラス … 1-10 は base+02〜0B の 1 バイト、11-16 は base+10〜15
+	//   バリエーション     … 1-10 は 02 01 42 から 2 バイトずつ、11-16 は 02 01 70〜75
+	//   インサーション     … 表の番地そのまま（2 バイトのものは +0x18 に 16bit で並ぶ）
+	auto read_param = [&](const slot_def &s, const xg::fx_param &p, int index) {
+		if (s.ins >= 0)
+			return p.addr >= 0x30 ? ins_wide(ram, s.ins, p.addr)
+			                      : xg_read(ram, s.hi, s.mid, s.base + p.addr, p.size);
+		if (s.id == nfx::VARIATION) {
+			if (p.addr >= 0x30 || index < 10)
+				return xg_read(ram, s.hi, s.mid, 0x42 + 2 * index, 2);
+			return xg_read(ram, s.hi, s.mid, 0x70 + (p.addr - 0x20), 1);
+		}
+		if (p.addr >= 0x20)
+			return xg_read(ram, s.hi, s.mid, s.base + 0x10 + (p.addr - 0x20), 1);
+		return xg_read(ram, s.hi, s.mid, s.base + p.addr, p.size);
+	};
+
+	for (const slot_def &s : SLOTS) {
+		const int type = xg_read(ram, s.hi, s.mid, s.base, 2);
+		if (type < 0)
+			continue;
+		const xg::fx_def *def = xg::fx_find(type);
+		int raw[16] = {};
+		const int n = def ? std::min(def->count, 16) : 0;
+		for (int i = 0; i < n; i++) {
+			const xg::fx_param &p = def->params[i];
+			const int v = read_param(s, p, i);
+			raw[i] = v < 0 ? int(p.lo) : v;
+		}
+		m_nfx.set(s.id, type, raw, n);
+		// 調べもの用: SMU2000_NATIVE_FX_DEBUG=1 で、読んだ値を出す
+		static const bool dbg = std::getenv("SMU2000_NATIVE_FX_DEBUG") != nullptr;
+		if (dbg) {
+			std::printf("nfx slot %d type %02x %02x kind %d:", int(s.id), type >> 7, type & 0x7f,
+			            int(m_nfx.slot(s.id).current()));
+			for (int i = 0; i < n; i++)
+				std::printf(" %s=%d", def->params[i].label, raw[i]);
+			std::putchar(10);
+		}
+
+		// 戻り量。XG の 64 を基準にする（送りに対する量で、実機の中身とは別物）
+		if (s.ret_lo >= 0) {
+			const int ret = xg_read(ram, s.hi, s.mid, s.ret_lo, 1);
+			// 戻り量の基準。実機の混ざり具合に合わせた実測の値（SMU2000_NATIVE_RETURN で変えられる）
+			static const float base = [] {
+				const char *e = std::getenv("SMU2000_NATIVE_RETURN");
+				return e ? float(std::atof(e)) : 0.8f;
+			}();
+			float g = ret < 0 ? base : base * float(ret) / 64.0f;
+			// バリエーションを INSERTION でパートに掛けているときは、送りの目盛りが
+			// インサーションと同じになる（戻り量は使われない）
+			if (s.id == nfx::VARIATION && xg_read(ram, 0x02, 0x01, 0x5a, 1) == 0)
+				g = 0.31f;
+			m_nfx.set_return(s.id, g);
+		}
+	}
+
+	// マスター EQ（02 40 00-14）
+	{
+		int gain[5], freq[5], q[5];
+		static const int G[5] = { 0x01, 0x05, 0x09, 0x0d, 0x11 };
+		bool ok = true;
+		for (int i = 0; i < 5; i++) {
+			gain[i] = xg_read(ram, 0x02, 0x40, G[i], 1);
+			freq[i] = xg_read(ram, 0x02, 0x40, G[i] + 1, 1);
+			q[i]    = xg_read(ram, 0x02, 0x40, G[i] + 2, 1);
+			if (gain[i] < 0 || freq[i] < 0 || q[i] < 0)
+				ok = false;
+		}
+		const int shape1 = xg_read(ram, 0x02, 0x40, 0x04, 1);
+		const int shape5 = xg_read(ram, 0x02, 0x40, 0x14, 1);
+		if (ok)
+			m_nfx.meq().set_raw(gain, freq, q, shape1 < 0 ? 0 : shape1, shape5 < 0 ? 0 : shape5);
+	}
+}
+
 void mu2000::run_sample(s32 &left, s32 &right)
 {
+	// S-MU2000: 軽量モードでは、XG の設定をときどき読み直す
+	if (m_nfx_on && !(++m_nfx_tick & 0x1ff))
+		native_fx_update();
+
 	// 台数が変わっていたら別スレッドの使い方を見直す（8192 サンプルごと）
 	if (m_want_threaded && !(++m_thread_check & 0x1fff))
 		apply_threading();
@@ -913,7 +1213,7 @@ namespace {
 
 // 保存の形。中身の並びを変えたら上げる
 constexpr u32 STATE_MAGIC   = 0x554d3253;   // "S2MU"
-constexpr u32 STATE_VERSION = 6;   // 2: MIDI の入口が A/B の 2 口になった / 3: SWP30 のピッチ EG / 4: サンプリングの録音の位置 / 5: SmartMedia の命令の途中 / 6: MEG の印と 2 つ目の idx
+constexpr u32 STATE_VERSION = 10;  // 2: MIDI の入口が A/B の 2 口になった / 3: SWP30 のピッチ EG / 4: サンプリングの録音の位置 / 5: SmartMedia の命令の途中 / 6: MEG の印と 2 つ目の idx / 7: USB の口（C・D）の受け取り途中 / 8: 2 つ目の A/D 変換器（AN4 = HOST SELECT） / 9: SWP30 の書き込みの待ち / 10: USB のコマンド（M37640 からの知らせ）
 constexpr u32 STATE_VERSION_OLDEST = 2;
 
 } // namespace
@@ -946,6 +1246,9 @@ void mu2000::state(state_io &s)
 	// **前のサンプルからのはみ出し**。これが無いと、戻した直後の 1 サンプルで
 	// CPU の回す量が数サイクルずれる
 	s.v(m_overrun);
+	// 版 9 から: SWP30 へ書いた待ちの残り（サンプルを跨ぐことがある）
+	if (s.version() >= 9)
+		s.v(m_swp_wait);
 
 	// 受け取り途中の MIDI。A と B の 2 口ぶん
 	s.tag("midi");
@@ -965,6 +1268,46 @@ void mu2000::state(state_io &s)
 		}
 		s.v(m.bit); s.v(m.cur); s.v(m.next);
 	}
+
+	// 版 7 から: USB の口（C・D）の受け取り途中。firmware へ渡す前のバイト列
+	if (s.version() >= 7) {
+		s.tag("usb");
+		u32 n = u32(m_usb.rx.size());
+		s.v(n);
+		if (s.writing()) {
+			for (u8 b : m_usb.rx)
+				s.v(b);
+		} else {
+			m_usb.rx.clear();
+			for (u32 i = 0; i < n && s.ok(); i++) {
+				u8 b = 0;
+				s.v(b);
+				m_usb.rx.push_back(b);
+			}
+		}
+		s.v(m_usb.in_port); s.v(m_usb.next); s.v(m_usb.have); s.v(m_usb.cur); s.v(m_usb.tx_next);
+		if (s.version() >= 10) {
+			u32 c = u32(m_usb.cmd.size());
+			s.v(c);
+			if (s.writing()) {
+				for (u8 b : m_usb.cmd)
+					s.v(b);
+			} else {
+				m_usb.cmd.clear();
+				for (u32 i = 0; i < c && s.ok(); i++) {
+					u8 b = 0;
+					s.v(b);
+					m_usb.cmd.push_back(b);
+				}
+			}
+			s.v(m_usb.cur_cmd);
+		}
+	}
+}
+
+u32 mu2000::state_version()
+{
+	return STATE_VERSION;
 }
 
 std::vector<u8> mu2000::save_state() const
