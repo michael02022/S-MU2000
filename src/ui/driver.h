@@ -39,16 +39,18 @@ public:
 	{
 		u8 b;
 		while (br.take_midi(b)) {
-			watch(b, mu.midi_in(b));
+			mu.midi_in(b);
+			watch(b, 0);
 			echo(b);
 		}
 		// パラメータの層の問い合わせ。外へは流さない
 		while (br.take_ask(b))
 			mu.midi_in(b);
-		// 画面から口 B・C・D へ（一覧の鍵盤）。外へは流さない
-		for (int port = 1; port < mu2000::MIDI_PORTS; port++)
-			while (br.take_midi_port(port, b))
-				watch(b, mu.midi_in(b, port));
+		// 画面から口 B へ（一覧の鍵盤）。外へは流さない
+		while (br.take_midi_b(b)) {
+			mu.midi_in(b, 1);
+			watch(b, 1);
+		}
 	}
 
 	void pump_midi(mu2000 &mu, bridge &br)
@@ -85,8 +87,7 @@ public:
 	// （音源の中の鍵の状態はきれいに取り出せないので、入口で数える）
 	void watch(u8 b, int port)
 	{
-		if (port < 0 || port >= mu2000::MIDI_PORTS)
-			return;
+		port = port ? 1 : 0;
 		if (b >= 0xf8)
 			return;                           // リアルタイム
 		if (b == 0xf0) {
@@ -178,21 +179,15 @@ public:
 	// firmware のワーク RAM から XG の値を写す（xg/ram.h）
 	void publish_xg(mu2000 &mu, bridge &br)
 	{
-		copy_xg(mu, m_xg);
+		const std::vector<u8> &ram = mu.nvram();
+		std::memcpy(m_xg.system, ram.data() + xg::ram::SYSTEM, XG_SYSTEM_SIZE);
+		m_xg.voice_mode = ram[xg::ram::VOICE_MODE];
+		m_xg.voice_set  = ram[xg::ram::VOICE_SET];
+		std::memcpy(m_xg.effect, ram.data() + xg::ram::EFFECT, XG_EFFECT_SIZE);
+		for (int p = 0; p < XG_PARTS; p++)
+			std::memcpy(m_xg.parts[p], ram.data() + xg::ram::part_base(p), XG_PART_COPY);
 		m_xg.serial++;
 		br.publish_xg(m_xg);
-	}
-
-	// XG の値だけを写す（鍵の見張りの欄と serial には触らない）。機械を持っている糸から呼ぶこと
-	static void copy_xg(mu2000 &mu, xg_snapshot &out)
-	{
-		const std::vector<u8> &ram = mu.nvram();
-		std::memcpy(out.system, ram.data() + xg::ram::SYSTEM, XG_SYSTEM_SIZE);
-		out.voice_mode = ram[xg::ram::VOICE_MODE];
-		out.voice_set  = ram[xg::ram::VOICE_SET];
-		std::memcpy(out.effect, ram.data() + xg::ram::EFFECT, XG_EFFECT_SIZE);
-		for (int p = 0; p < XG_PARTS; p++)
-			std::memcpy(out.parts[p], ram.data() + xg::ram::part_base(p), XG_PART_COPY);
 	}
 
 	static void publish_now(mu2000 &mu, bridge &br, bool ready, const char *message)
@@ -208,8 +203,6 @@ public:
 						img[16 * (row * cols + col) + y];
 		s.leds   = mu.leds();
 		s.lcd_on = lcd.display_on();
-		s.voices_master = u8(mu.swpm().sounding_voices());
-		s.voices_slave  = u8(mu.swps().sounding_voices());
 		s.ready  = ready;
 		if (!ready && message)
 			std::snprintf(s.message, sizeof(s.message), "%s", message);
@@ -228,11 +221,11 @@ private:
 	u64 m_applied = 0;
 	u64 m_since = 0;
 	xg_snapshot m_xg;                        // 音声の糸だけが触る
-	u8   m_status[mu2000::MIDI_PORTS] = {}, m_data[mu2000::MIDI_PORTS][2] = {};
-	int  m_have[mu2000::MIDI_PORTS] = {};
-	bool m_sysex[mu2000::MIDI_PORTS] = {};
-	u8   m_sx[mu2000::MIDI_PORTS][16] = {};                    // SysEx の頭（リセットかを見るだけ）
-	size_t m_sx_len[mu2000::MIDI_PORTS] = {};
+	u8   m_status[2] = {}, m_data[2][2] = {};
+	int  m_have[2] = {};
+	bool m_sysex[2] = {};
+	u8   m_sx[2][16] = {};                    // SysEx の頭（リセットかを見るだけ）
+	size_t m_sx_len[2] = {};
 };
 
 } // namespace ui

@@ -5,6 +5,9 @@ build-*/
 *.exe
 *.wav
 roms/
+# tools/make_reabank.py lee nombres del mu2000_flash.bin del usuario;
+# el resultado nunca se distribuye (mismo motivo que roms/)
+*.reabank
 
 # 同じところで MAME を走らせたときに出るもの
 cfg/

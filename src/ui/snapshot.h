@@ -41,13 +41,11 @@ struct snapshot {
 	bool lcd_on = false;
 	bool ready = false;          // 起動が終わったか
 	char message[96] = {};       // 起動中／ROM が無い等。空なら出さない
-	// 鳴っている声の数（SWP30 のマスタとスレーブ、それぞれ 64 スロット）
-	u8   voices_master = 0, voices_slave = 0;
 };
 
 // XG の値の写し。音声の糸が firmware のワーク RAM から 25ms ごとに写す（xg/ram.h）。
 // 画面は MU2000 に問い合わせずにこれを読む
-constexpr int XG_PARTS = 64;   // 口 A-D。C・D は実機では USB だけの口
+constexpr int XG_PARTS = 32;
 constexpr int XG_PART_COPY = 0x100;     // xg::ram::PART_COPY
 constexpr int XG_SYSTEM_SIZE = 7;
 constexpr int XG_EFFECT_SIZE = 0x16b;   // xg::ram::EFFECT_SIZE

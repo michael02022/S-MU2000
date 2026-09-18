@@ -613,10 +613,12 @@ void swp30_device::streaming_block::read_8(memory_access<25, 2, -2, ENDIANNESS_L
 	scale_and_clamp(val0, val1, val2, val3);
 }
 
-// S-MU2000: mode・scale・limit は m_address から決まり、展開の輪の中では変わらない。
-// 呼ぶ側（read_8c）が輪の外で 1 回だけ作って渡す。中身の計算は変えていない
-void swp30_device::streaming_block::dpcm_step(u8 input, u32 mode, u32 scale, s32 limit)
+void swp30_device::streaming_block::dpcm_step(u8 input)
 {
+	u32 mode = (m_address >> 25) & 3;
+	u32 scale = (m_address >> 27) & 7;
+	s32 limit = max_value[scale];
+
 	m_dpcm_s0 = m_dpcm_s1;
 	m_dpcm_s1 = m_dpcm_s2;
 	m_dpcm_s2 = m_dpcm_s3;
@@ -679,15 +681,12 @@ void swp30_device::streaming_block::read_8c(memory_access<25, 2, -2, ENDIANNESS_
 		val3 = m_dpcm_s3;
 		return;
 	} else {
-		const u32 mode  = (m_address >> 25) & 3;
-		const u32 scale = (m_address >> 27) & 7;
-		const s32 limit = max_value[scale];
 		s32 spos =  m_dpcm_pos;
 		base_address += spos >> 2;
 		u32 cv = wave.read_dword(base_address);
 		while(spos != m_pos + 4) {
 			u8 input = cv >> ((spos & 3) << 3);
-			dpcm_step(input, mode, scale, limit);
+			dpcm_step(input);
 			spos++;
 			if((spos & 3) == 0) {
 				base_address ++;
@@ -1466,26 +1465,15 @@ bool swp30_device::envelope_block::active() const
 	return m_envelope_level != 0x3fff || m_envelope_mode != RELEASE;
 }
 
-int swp30_device::sounding_voices() const
-{
-	int n = 0;
-	for (const envelope_block &e : m_envelope)
-		n += e.active();
-	return n;
-}
-
-u16 swp30_device::envelope_block::level_step(s32 level, u32 sample_counter)
+u16 swp30_device::envelope_block::level_step(u32 level, u32 sample_counter)
 {
 	// Phase is incorrect, and very weird
 
 	if(level >= 0x78)
 		return 0x7f;
 
-	// S-MU2000: level は負にもなる（ピッチ EG は 16 段遅らせて引く）。
-	// 算術シフトなので k0 がそのまま増え、8 段下がるごとに半分の速さになる。
-	// 下は -16（k0 = 10）までしか来ない
-	s32 k0 = level >> 3;
-	u32 k1 = u32(level) & 7;
+	u32 k0 = level >> 3;
+	u32 k1 = level & 7;
 
 	if(level >= 0x48) {
 		k0 -= 9;
@@ -1503,13 +1491,13 @@ u16 swp30_device::envelope_block::level_step(s32 level, u32 sample_counter)
 		return (mx[k1] >> s1) & 1;
 	}
 
-	const u32 sh = u32(8 - k0);       // 負の level ではここが 8 より大きくなる
+	k0 = 8 - k0;
 
-	if(sample_counter & util::make_bitmask<u32>(sh))
+	if(sample_counter & util::make_bitmask<u32>(k0))
 		return 0;
 
 	static const u16 mx[8] = { 0x5555, 0x5557, 0x5757, 0x5777, 0x7777, 0x777f, 0x7f7f, 0x7fff };
-	return (mx[k1] >> ((sample_counter >> sh) & 0xf)) & 1;
+	return (mx[k1] >> ((sample_counter >> k0) & 0xf)) & 1;
 }
 
 u16 swp30_device::envelope_block::step(u32 sample_counter)
@@ -1708,17 +1696,6 @@ void swp30_device::lfo_block::step(swp30_device &swp)
 
 u16 swp30_device::lfo_block::get_amplitude() const
 {
-	// S-MU2000: 三角波の音量側は、音程側（tri_state、中央から上がる）と違い、一番下（効きなし）から
-	// 上がり始める。中央から始めていたころは、要素自身が音量の LFO を持つ XG の変化音色
-	// （0/21/38・0/64/44・0/69/90・0/70/7 など）の頭が実機より最大 6dB 小さかったり大きかったりした。
-	// 1/4 周期ずつ 4 通り試して、実機で 2 回ずつ録った 116 音色との差が一番小さいのがこの形
-	// （合計 325 → 273。上の 6 つは 1.6〜6.0dB → 0.0〜0.1dB。doc/todo.md）。
-	// モジュレーションホイールで掛けるトレモロは firmware が音量を書き換えるので、ここを通らない
-	if(m_type == 1) {
-		const u32 c = m_counter;
-		const u32 st = c & 0x20000 ? (~c >> 5) & 0xffe : (c >> 5) & 0xffe;
-		return (st * m_amplitude) >> 5;
-	}
 	return (m_state * m_amplitude) >> 5;
 }
 
@@ -1945,9 +1922,6 @@ void swp30_device::reset()
 	m_revram_data = 0;
 	m_revram_enable = 0;
 
-	for(auto &s : m_nsend)
-		s[0] = s[1] = 0;
-
 	std::fill(m_meli.begin(),  m_meli.end(),  0);
 	std::fill(m_melo.begin(),  m_melo.end(),  0);
 	std::fill(m_adc.begin(),   m_adc.end(),   0);
@@ -2064,12 +2038,6 @@ void swp30_device::write16(offs_t addr, u16 data)
 	addr &= 0xfff;
 	const u32 slot = addr & 0x3f;
 	const u32 chan = (addr >> 6) & 0x3f;
-
-	if(const char *e = getenv("WTRACE")) {
-		const u32 from = u32(atoi(e));
-		if(m_meg->m_sample_counter >= from && m_meg->m_sample_counter < from + 30000)
-			fprintf(stderr, "W %u ch%02x sl%02x = %04x\n", m_meg->m_sample_counter, chan, slot, data);
-	}
 
 	// --- チャンネルごとのレジスタ（全 64ch 共通、offset にチャンネル<<6 を渡す）
 	switch(slot) {
@@ -2409,13 +2377,7 @@ u32 swp30_device::meg_state::revram_decode(u16 v)
 void swp30_device::revram_enable_w(u16 data)
 {
 	logerror("revram enable = %04x\n", data);
-	if(data == m_revram_enable)
-		return;
 	m_revram_enable = data;
-	// S-MU2000: 無効な区画への出し入れは訳すときに省いてあるので、変わったら訳し直す。
-	// プログラムが変わったときと同じで、書き込みが落ち着くまでは解釈実行で回す
-	meg_jit_invalidate();
-	m_meg_jit_wait = 1;
 }
 
 void swp30_device::revram_clear_w(u16 data)
@@ -2520,12 +2482,7 @@ void swp30_device::peg_rate_w(offs_t offset, u16 data)
 
 // 今の値を目標へ、速さ（スロット 0x0B の bit 14-8）で近づける。刻みは音量の EG と同じ表を
 // 16 段遅らせて引く（4 分の 1 の速さ）。DuckLead の -375 セント → +100 → 0 と Bund、VoxLead の
-// 鳴り始めが実機と合う。
-//
-// S-MU2000: 16 より小さい速さは 0 で止めていたが、実機はそこから下も続いていた。
-// XG の SFX「Starship」（バンク 64 の 88 番）は速さ 8 を使う。止めていたころは
-// ピッチの登りが実機の 2 倍（+1.55 半音 / 実機 +0.75 半音）になっていた。
-// 表は 8 段下がるごとに半分の速さなので、符号付きのまま引けばそのまま伸びる
+// 鳴り始めが実機と合う。16 より小さい速さは 0 にしている（実機で確かめていない）
 void swp30_device::peg_step(int chan)
 {
 	const s32 target = s32(util::sext(u32(m_pitch_offset[chan] & 0x3fff), 14));
@@ -2534,7 +2491,7 @@ void swp30_device::peg_step(int chan)
 		m_peg_reached[chan] = 1;
 		return;
 	}
-	const int rate = int((m_peg_rate[chan] >> 8) & 0x7f) - 16;
+	const int rate = std::max(int((m_peg_rate[chan] >> 8) & 0x7f) - 16, 0);
 	const s32 step = m_envelope[chan].level_step(rate, m_meg->m_sample_counter);
 	if(cur < target) {
 		cur += step;
@@ -3028,32 +2985,6 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 	m_rec_bus = mixer_out[0x10];   // S-MU2000: 録音はミキサの出力 8 の左（sample_step）
 	std::copy(mixer_out.begin() + 0x00, mixer_out.begin() + 0x10, m_melo.begin());
 	std::copy(mixer_out.begin() + 0x10, mixer_out.begin() + 0x20, m_meg->m_m.begin() + 0x20);
-	// S-MU2000: 軽量モードでは、エフェクトへの送りを横取りして MEG には渡さない。
-	// MEG 側は無音を受けるので、出てくるのはこちらの C++ のエフェクトだけになる
-	if(m_native) {
-		static const int SLOT[4] = { 0x24, 0x26, 0x2c, 0x28 };   // リバーブ・コーラス・バリエーション・インサーション 1
-		for(int i = 0; i != 4; i++) {
-			m_nsend[i][0] = m_meg->m_m[SLOT[i]];
-			m_nsend[i][1] = m_meg->m_m[SLOT[i] + 1];
-			m_meg->m_m[SLOT[i]] = m_meg->m_m[SLOT[i] + 1] = 0;
-		}
-		if(m_native_full) {
-			// 乾いた音はミキサの出力 8（m20/m21）。MEG を回さないので、ミキサの入力 64-79
-			// （MEG の出口）は毎サンプル 0 にしてあり、ここには声だけが集まっている
-			m_ndry[0] = m_meg->m_m[0x20];
-			m_ndry[1] = m_meg->m_m[0x21];
-			for(int i = 0x20; i != 0x30; i++)
-				m_meg->m_m[i] = 0;
-		}
-	}
-	// 調べもの用（一時）: エフェクトへの送り 16 本を書き出す
-	if(m_dbg_dac && m_meg->m_sample_counter >= m_dbg_dac_from &&
-	   m_meg->m_sample_counter < m_dbg_dac_from + m_dbg_dac_count) {
-		fprintf(m_dbg_dac, "send %u", m_meg->m_sample_counter);
-		for(int i = 0x10; i != 0x20; i++)
-			fprintf(m_dbg_dac, " s%02x=%d", i - 0x10, mixer_out[i]);
-		fprintf(m_dbg_dac, "\n");
-	}
 }
 
 
@@ -3383,15 +3314,6 @@ void swp30_device::meg_state::lfo_step()
 {
 	for(int i = 0; i != 24; i++)
 		m_lfo_counter[i] = (m_lfo_counter[i] + m_lfo_increment[i]) & 0x3fffff;
-}
-
-int swp30_device::meg_state::region_of(u16 pc) const
-{
-	const u16 key = (pc / 12) << 11;
-	for(int i=0; i != 8; i++)
-		if(i == 7 || m_map[i+1] <= m_map[i] || ((m_map[i+1] & 0xf800) > key))
-			return i;
-	return 7;
 }
 
 u32 swp30_device::meg_state::resolve_address(u16 pc, s32 offset)
@@ -3786,10 +3708,6 @@ void swp30_device::meg_state::step()
 	// Memory access
 	switch(d.memop) {
 	case 1: {
-		// S-MU2000: 区画が無効の間（エフェクトの種類を替えている最中など）は、
-		// 遅延メモリへの書き込みを落とす（doc/upstream.md の 33）
-		if(BIT(m_swp->m_revram_enable, region_of(m_pc)))
-			break;
 		u32 address = resolve_address(m_pc, m_offset[m_pc/3] + (d.mem_use_index ? m_ram_index : 0) + (d.mem_use_index2 ? m_swp->m_meg_ram_index2 : 0) - m_sample_counter);
 		if(address != 0xffffffff)
 			// S-MU2000: リバーブ RAM も実体は素の配列。18bit ぶんで折り返す
@@ -3802,12 +3720,6 @@ void swp30_device::meg_state::step()
 		if(d.mem_table) {
 			const u32 address = (u32(m_offset[m_pc/3]) + (d.mem_use_index ? m_ram_index : 0) + (d.mem_use_index2 ? m_swp->m_meg_ram_index2 : 0) + (d.memop == 3 ? 1 : 0)) & 0x3ffff;
 			m_memr_value[m_delay_2] = revram_decode(m_swp->m_reverb_ram[address]);
-			m_memr_active[m_delay_2] = true;
-			break;
-		}
-		// 区画が無効の間は 0 が返る（書き込みと同じく doc/upstream.md の 33）
-		if(BIT(m_swp->m_revram_enable, region_of(m_pc))) {
-			m_memr_value[m_delay_2] = 0;
 			m_memr_active[m_delay_2] = true;
 			break;
 		}
@@ -3922,7 +3834,6 @@ void swp30_device::meg_state::build_ops(op *ops) const
 			if(i == 7 || m_map[i+1] <= m_map[i] || ((m_map[i+1] & 0xf800) > key)) {
 				o.addr_mask = (1 << (10+BIT(m_map[i], 8, 3))) - 1;
 				o.addr_base = BIT(m_map[i], 0, 8) << 10;
-				o.region    = u8(i);
 				break;
 			}
 	}
@@ -4088,14 +3999,6 @@ void swp30_device::meg_state::run_program(const op *ops)
 			goto mem_done;
 		}
 		if(o.memop) {
-			// S-MU2000: 区画が無効の間は、書き込みは落ち、読み出しは 0 になる（step() と同じ）
-			if(BIT(m_swp->m_revram_enable, o.region)) {
-				if(o.memop != 1) {
-					m_memr_value[d2] = 0;
-					m_memr_active[d2] = true;
-				}
-				goto mem_done;
-			}
 			u32 off = u32(m_offset[o.offset_index]) + u32(o.mem_use_index ? m_ram_index : 0) + u32(o.mem_use_index2 ? ram_index2 : 0) - sample_counter;
 			if(o.memop == 3)
 				off += 1;
@@ -4145,9 +4048,7 @@ void swp30_device::run_sample(s32 &left, s32 &right)
 	}
 
 	sample_step();
-	if(m_native && m_native_full) {
-		// S-MU2000: 完全な軽量モード。MEG の 384 段は回さない（doc/native-dsp.md）
-	} else if(m_dbg_meg) {
+	if(m_dbg_meg) {
 		// S-MU2000: 1 命令ずつ追うときは元の step() で回す
 		for(int i = 0; i != 384; i++)
 			m_meg->step();
@@ -4165,43 +4066,6 @@ void swp30_device::run_sample(s32 &left, s32 &right)
 	// DAC は出力 0-3 の先頭 2 本。scale は 1<<17。
 	left  = m_adc[0];
 	right = m_adc[1];
-
-	// S-MU2000: 軽量モードの C++ エフェクトを、ここで足す（doc/native-dsp.md）
-	if(m_native) {
-		constexpr float SCALE = 131072.0f;      // m_adc の全振幅（0x20000）
-		using nfx = smu2000::dsp::native_fx;
-		static const nfx::slot_id ID[4] = { nfx::REVERB, nfx::CHORUS, nfx::VARIATION, nfx::INS1 };
-		float wl = 0.0f, wr = 0.0f;
-		for(int i = 0; i != 4; i++) {
-			if(!(m_native_mask & (1 << i)))
-				continue;
-			const float il = float(m_nsend[i][0]) / SCALE, ir = float(m_nsend[i][1]) / SCALE;
-			float ol = 0.0f, orr = 0.0f;
-			m_native->process(ID[i], il, ir, ol, orr);
-			const float g = m_native->ret(ID[i]);
-			wl += ol * g;
-			wr += orr * g;
-		}
-		// MEG を通る道で減るぶん（実測で合わせた）。乾いた音も送りも同じ目盛りなので、
-		// どちらのモードでもこれを掛ける
-		constexpr float DRY_GAIN = 0.1767f;
-		if(m_native_full) {
-			// MEG を回していないので、乾いた音もここで混ぜてマスター EQ を掛ける。
-			// 目盛りは MEG の出口（m30/m31 >> 4）に合わせてある
-			// 乾いた音の大きさ。MEG を通ると減るぶんを実測で合わせた
-			// （同じ曲を MEG 有り・無しで書き出して rms をそろえた）
-			const float dl = float(m_ndry[0]) / SCALE, dr = float(m_ndry[1]) / SCALE;
-			float ml = (dl + wl) * DRY_GAIN, mr = (dr + wr) * DRY_GAIN;
-			m_native->meq().process(ml, mr, ml, mr);
-			left  = std::clamp<s32>(s32(ml * SCALE), -0x20000, 0x1ffff);
-			right = std::clamp<s32>(s32(mr * SCALE), -0x20000, 0x1ffff);
-			m_adc[0] = left;
-			m_adc[1] = right;
-		} else {
-			left  += s32(wl * SCALE * DRY_GAIN);
-			right += s32(wr * SCALE * DRY_GAIN);
-		}
-	}
 
 	// S-MU2000: 音が出ないときの手掛かり。-v のときだけ最大値を覚える
 	if(::smu2000::g_verbose) {

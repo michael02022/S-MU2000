@@ -7,7 +7,6 @@
 #include "xg/fx_params.h"
 #include "xg/fx_types.h"
 #include "fx_help.h"
-#include "fx_icons.h"
 #include "eq_curve.h"
 
 #include <algorithm>
@@ -348,7 +347,7 @@ void fx_editor::draw(xg::model &m, const xg_snapshot &, bridge &br)
 	ImGui::TextUnformatted("種類");
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(fs * 11);
-	if (begin_fx_combo("##type", has_type ? type : -1, ImGuiComboFlags_HeightLarge)) {
+	if (ImGui::BeginCombo("##type", has_type ? xg::fx_name(type).c_str() : "--", ImGuiComboFlags_HeightLarge)) {
 		// 品書きの形（分類 → 系統 → LSB 違い）で選ぶ
 		int chosen = 0;
 		if (fx_type_menu(xg::ins_types(), has_type ? type : -1, chosen)) {
@@ -361,10 +360,10 @@ void fx_editor::draw(xg::model &m, const xg_snapshot &, bridge &br)
 	ImGui::TextUnformatted("掛けるパート");
 	ImGui::SameLine();
 	ImGui::SetNextItemWidth(fs * 6);
-	if (ImGui::BeginCombo("##part", part < XG_PARTS + 2 ? part_name(part).c_str() : "OFF", ImGuiComboFlags_HeightLarge)) {
-		if (ImGui::Selectable("OFF", part >= XG_PARTS + 2))
+	if (ImGui::BeginCombo("##part", part < 32 ? part_name(part).c_str() : "OFF", ImGuiComboFlags_HeightLarge)) {
+		if (ImGui::Selectable("OFF", part >= 32))
 			br.send(m.set(ppart, 0, 127));
-		for (int i = 0; i < XG_PARTS + 2; i++)   // 64 パートの後ろに AD1・AD2
+		for (int i = 0; i < 32; i++)
 			if (ImGui::Selectable(part_name(i).c_str(), i == part))
 				br.send(m.set(ppart, 0, i));
 		ImGui::EndCombo();
@@ -393,17 +392,15 @@ void fx_editor::draw(xg::model &m, const xg_snapshot &, bridge &br)
 	// 名前のプレート
 	const std::string title = has_type ? xg::fx_name(type) : "--";
 	ImFont *font = ImGui::GetFont();
-	if (has_type)
-		fx_icon(dl, ImVec2(pos.x + fs * 1.8f, pos.y + fs * 0.85f), fs * 1.9f, msb, IM_COL32(250, 250, 240, 230));
-	dl->AddText(font, fs * 1.9f, ImVec2(pos.x + fs * (has_type ? 4.2f : 1.8f), pos.y + fs * 0.8f), IM_COL32(250, 250, 240, 255), title.c_str());
+	dl->AddText(font, fs * 1.9f, ImVec2(pos.x + fs * 1.8f, pos.y + fs * 0.8f), IM_COL32(250, 250, 240, 255), title.c_str());
 	char sub[64];
-	std::snprintf(sub, sizeof(sub), "INSERTION %d  →  %s", slot, part < XG_PARTS + 2 ? part_name(part).c_str() : "OFF");
+	std::snprintf(sub, sizeof(sub), "INSERTION %d  →  %s", slot, part < 32 ? part_name(part).c_str() : "OFF");
 	dl->AddText(ImVec2(pos.x + fs * 1.9f, pos.y + fs * 3.0f), IM_COL32(250, 250, 240, 150), sub);
 	// 動作ランプ（パートに掛かっていれば点く）
 	const ImVec2 lamp(end.x - fs * 2.2f, pos.y + fs * 1.8f);
-	if (part < XG_PARTS + 2)
+	if (part < 32)
 		dl->AddCircleFilled(lamp, fs * 0.9f, IM_COL32(255, 60, 40, 60), 24);
-	dl->AddCircleFilled(lamp, fs * 0.45f, part < XG_PARTS + 2 ? IM_COL32(255, 80, 60, 255) : IM_COL32(70, 22, 18, 255), 20);
+	dl->AddCircleFilled(lamp, fs * 0.45f, part < 32 ? IM_COL32(255, 80, 60, 255) : IM_COL32(70, 22, 18, 255), 20);
 
 	const float left = pos.x + fs * 1.8f, right = end.x - fs * 1.8f;
 	// 種類の説明

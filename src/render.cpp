@@ -12,7 +12,6 @@
 // 出来た WAV は MAME の録音と突き合わせるためのもの。
 
 #include "mu2000.h"
-#include "bootcache.h"
 #include "smf.h"
 
 #include <algorithm>
@@ -161,10 +160,6 @@ int main(int argc, char **argv)
 	bool duration_given = false;
 	bool trace_midi = false;
 	bool fast_midi = false;
-	bool usb_host  = false;
-	bool use_bootcache = false;   // --bootcache。起動後の写しから始める（確かめ用）
-	int native_fx = 0;            // --native-fx / --native-fx-full（doc/native-dsp.md）
-	const char *state_at = nullptr; size_t state_sample = 0;   // --state-at（確かめ用）
 	const char *forced_reset = nullptr;
 	const char *swptrace = nullptr;
 	bool single = false;   // スレーブを別スレッドにしない
@@ -205,18 +200,6 @@ int main(int argc, char **argv)
 			trace_midi = true;
 		else if (!std::strcmp(argv[i], "--fast-midi"))
 			fast_midi = true;
-		else if (!std::strcmp(argv[i], "--usb"))
-			usb_host = true;
-		else if (!std::strcmp(argv[i], "--native-fx"))
-			native_fx = 1;
-		else if (!std::strcmp(argv[i], "--native-fx-full"))
-			native_fx = 2;
-		else if (!std::strcmp(argv[i], "--bootcache"))
-			use_bootcache = true;
-		else if (!std::strcmp(argv[i], "--state-at") && i + 2 < argc) {
-			state_sample = size_t(std::strtoull(argv[++i], nullptr, 0));
-			state_at = argv[++i];
-		}
 		else if (!std::strcmp(argv[i], "--reset")) {
 			if (i + 1 >= argc) {
 				std::fprintf(stderr, "--reset requires gm, gs, or xg\n");
@@ -287,11 +270,6 @@ int main(int argc, char **argv)
 
 	mu.set_threaded(!single);
 	mu.set_fast_midi(fast_midi);
-	mu.set_usb_host(usb_host);
-	if (native_fx)
-		mu.set_native_fx(native_fx);
-	// 鍵は起動に使うワーク RAM も混ぜるので reset() の前に作る
-	const u64 boot_key = use_bootcache ? smu2000::bootcache::key(mu) : 0;
 	mu.reset();
 
 	const u32 rate = 44100;
@@ -301,14 +279,6 @@ int main(int argc, char **argv)
 	// 待たずに流すと曲頭のリセットや音色指定が捨てられ、全パートが
 	// 初期音色（ピアノ）で鳴り、発音数も足りなくなって音が抜ける。
 	// firmware が受信を有効にした時点を印にする
-	// 起動後の写しから始める（--bootcache）。**確かめ用**で既定では使わない。
-	// 試験は毎回まっさらから始めたいので、ここを既定にはしない
-	if (use_bootcache && boot < 0.0) {
-		if (smu2000::bootcache::load(mu, boot_key)) {
-			std::printf("起動: 前の写しから\n");
-			boot = 0.0;
-		}
-	}
 	if (boot < 0.0) {
 		const size_t limit = size_t(30.0 * rate);
 		size_t i = 0;
@@ -319,8 +289,6 @@ int main(int argc, char **argv)
 			pcm.push_back(s16(std::clamp(r * 32768 / mu2000::DAC_FULL_SCALE, -32768, 32767)));
 		}
 		boot = double(i) / rate;
-		if (use_bootcache && i < limit)
-			smu2000::bootcache::save(mu, boot_key);
 		if (i >= limit) {
 			std::fprintf(stderr, "起動を待ったが MIDI 受信が有効にならなかった\n");
 			return 1;
@@ -328,7 +296,6 @@ int main(int argc, char **argv)
 		std::printf("起動に %.2f 秒。ここから MIDI を流す\n", boot);
 	}
 
-	const size_t boot_samples = size_t(boot * rate + 0.5);
 	const double estimated_seconds = duration_given ? seconds :
 		(events.empty() ? 3.0 : events.back().time + 3.0);
 	pcm.reserve(size_t((boot + estimated_seconds) * rate) * 2);
@@ -354,26 +321,14 @@ int main(int argc, char **argv)
 			if (i >= tail_start + size_t(3.0 * rate))
 				break;
 		}
-		if (state_at && i == size_t(boot * rate) + state_sample) {
-			const std::vector<u8> st = mu.save_state();
-			if (std::FILE *sf = std::fopen(state_at, "wb")) {
-				std::fwrite(st.data(), 1, st.size(), sf);
-				std::fclose(sf);
-			}
-		}
-		// 起動ぶんは**整数で引く**。double(i)/rate - boot と書くと桁落ちで
-		// 1e-12 秒ずれ、イベントの時刻がちょうど境に乗ったときに 1 サンプル動く
-		const double t = (double(i) - double(boot_samples)) / rate;
+		const double t = double(i) / rate - boot;
 		while (next < events.size() && events[next].time <= t) {
 			const std::vector<u8> &ev = events[next].bytes;
 			if (ev.size() == 2 && ev[0] == 0xf5)
 				port = std::clamp(int(ev[1]) - 1, 0, mu2000::MIDI_PORTS - 1);
 			else {
 				// ファイルの口 3・4 は gui の既定と同じく A・B に重ねる
-				// USB の口を使うときは C・D まで届くので、ファイルの口をそのまま使う
-				const int to = port >= 0 ? port
-					: usb_host ? std::min<int>(events[next].port, mu2000::MIDI_PORTS - 1)
-					: smf::mu_port(events[next].port, true);
+				const int to = port >= 0 ? port : smf::mu_port(events[next].port, true);
 				if (trace_midi)
 					trace_event(next, events[next], to);
 				if (const char *reset = reset_name(ev))

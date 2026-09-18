@@ -15,7 +15,6 @@
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
-#include "pluginterfaces/vst/ivstunits.h"
 
 namespace Steinberg {
 
@@ -33,7 +32,6 @@ DEF_CLASS_IID (IEditController2)
 DEF_CLASS_IID (IComponentHandler)
 DEF_CLASS_IID (IComponentHandler2)
 DEF_CLASS_IID (IMidiMapping)
-DEF_CLASS_IID (IUnitInfo)
 DEF_CLASS_IID (IEditControllerHostEditing)
 DEF_CLASS_IID (IEventList)
 DEF_CLASS_IID (IParameterChanges)

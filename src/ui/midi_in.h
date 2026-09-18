@@ -9,8 +9,7 @@
 // MIM_LONGDATA は一度も来ず、SysEx だけが黙って消える。
 //
 // macOS uses CoreMIDI, which hands whole packets over already, so it needs none
-// of that buffer pre-posting. Linux (ALSA sequencer, issue #25) is the same in
-// that respect, so it shares the macOS shape; see src/ui/midi_in_linux.cpp.
+// of that buffer pre-posting.
 
 #ifndef S_MU2000_UI_MIDI_IN_H
 #define S_MU2000_UI_MIDI_IN_H
@@ -25,7 +24,7 @@
 
 namespace ui {
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
 
 // macOS: CoreMIDI hands over whole packets, SysEx included, so there are no
 // receive buffers to pre-post the way WinMM needs. The shape is otherwise the
@@ -68,7 +67,7 @@ private:
 	std::atomic<u64>    m_bytes{0};
 	std::atomic<bool>   m_closing{false};
 
-	struct ctx;            // CoreMIDI (macOS) / ALSA sequencer (Linux), in the .cpp
+	struct ctx;            // CoreMIDI client / port / source, defined in the .cpp
 	ctx        *m_ctx = nullptr;
 	std::string m_name;
 };
@@ -128,7 +127,7 @@ private:
 	std::atomic<bool> m_closing{false};
 };
 
-#endif // __APPLE__ || __linux__
+#endif // __APPLE__
 
 } // namespace ui
 

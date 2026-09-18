@@ -34,11 +34,7 @@ import fingerprint as fpmod
 import make_test_midi
 
 ROOT = Path(__file__).resolve().parent.parent
-# 道具の置き場。Makefile の BUILD と同じもの（Linux は build-linux、
-# CROSS=windows は build-windows など）。環境変数 SMU_BUILD で渡す
-BUILD = Path(os.environ.get("SMU_BUILD") or (ROOT / "build"))
-if not BUILD.is_absolute():
-    BUILD = ROOT / BUILD
+BUILD = ROOT / "build"
 WORK = BUILD / "tests"
 BASE = ROOT / "tests"
 RATE = 44100
@@ -138,20 +134,13 @@ def step_statetest(rep, roms, midi):
     if not exe.exists():
         rep.add("statetest", False, "build/statetest%s が無い" % EXE)
         return
-    # DIN の口と USB の口の両方で確かめる。USB のときしか動かない所（HOST SELECT を
-    # 読む 2 つ目の A/D 変換器）の写し忘れは、DIN だけでは見つからない（issue #18）
-    ok = True
+    log = WORK / "statetest.log"
+    rc = run([exe, roms, midi, "--warm", "2.0", "--steps", "50"], out=log, err=log)
     note = ""
-    for tag, extra in (("statetest", []), ("statetest USB", ["--usb"])):
-        log = WORK / ("statetest%s.log" % ("_usb" if extra else ""))
-        rc = run([exe, roms, midi, "--warm", "2.0", "--steps", "50"] + extra, out=log, err=log)
-        this = ""
-        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("詰めると"):
-                this = line
-        rep.add(tag, rc == 0, this)
-        ok = ok and rc == 0
-        note = note or this
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("詰めると"):
+            note = line
+    rep.add("statetest", rc == 0, note)
 
 
 # MIDI を流し始める時刻を **固定する**。

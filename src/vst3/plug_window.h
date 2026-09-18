@@ -19,10 +19,6 @@
 
 #include <string>
 
-// PC で触る窓（一覧・エディタ）に渡すもの。型の中身はここでは要らない
-namespace xg { class model; }
-namespace ui { class bridge; struct xg_snapshot; }
-
 namespace smu2000 {
 namespace vst3 {
 
@@ -73,18 +69,6 @@ public:
 
 	// Say something went wrong (the panel has nowhere to put it)
 	virtual void alert(const std::string &text) = 0;
-
-	// A right click that missed the card slot. The GUI front end opens its
-	// settings menu there; a plug-in has no settings of its own, so by
-	// default there is no menu. Platforms with PC windows of their own
-	// offer those here instead
-	virtual void panel_menu(int x, int y) {}
-
-	// Drive the PC windows (overview, editor, insertion, part voice) one
-	// frame. Same ui::pc_window as gui.exe, opened from the panel's
-	// right-click menu. Called from the GUI thread at the panel's repaint
-	// rate; does nothing while no window is visible
-	virtual void pc_frame(::xg::model &, const ::ui::xg_snapshot &, ::ui::bridge &) {}
 };
 
 // The platform type string this build answers to: kPlatformTypeHWND on
